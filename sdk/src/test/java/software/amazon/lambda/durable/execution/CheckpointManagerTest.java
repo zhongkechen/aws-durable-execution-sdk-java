@@ -10,6 +10,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -79,17 +80,93 @@ class CheckpointManagerTest {
     void checkpoint_skipsApiCallWhenExecutionAlreadyCompleted() throws Exception {
         var finishCheckpointProcessing = mock(Runnable.class);
         var guardedBatcher = new CheckpointManager(
-                config, "arn:test", "token-1", callbackOperations::addAll, () -> false, finishCheckpointProcessing);
+                config,
+                "arn:test",
+                "token-1",
+                callbackOperations::addAll,
+                () -> false,
+                finishCheckpointProcessing,
+                () -> {});
         var update = OperationUpdate.builder()
                 .id("op-1")
                 .type(OperationType.STEP)
                 .action(OperationAction.START)
                 .build();
 
-        guardedBatcher.checkpoint(update).get(200, TimeUnit.MILLISECONDS);
+        var error = assertThrows(
+                Exception.class, () -> guardedBatcher.checkpoint(update).get(200, TimeUnit.MILLISECONDS));
+        assertInstanceOf(SuspendExecutionException.class, error.getCause());
 
         verifyNoInteractions(client);
         verify(finishCheckpointProcessing, never()).run();
+    }
+
+    @Test
+    void missingTokenRejectsPollersAndLaterUpdatesWithoutPagination() throws Exception {
+        when(client.checkpoint(any(), any(), any()))
+                .thenReturn(CheckpointDurableExecutionResponse.builder()
+                        .newExecutionState(CheckpointUpdatedExecutionState.builder()
+                                .nextMarker("unused")
+                                .build())
+                        .build());
+        var poller = batcher.pollForUpdate("poll", Instant.now().plusSeconds(60));
+        var update = OperationUpdate.builder()
+                .id("step")
+                .type(OperationType.STEP)
+                .action(OperationAction.START)
+                .build();
+        var error =
+                assertThrows(Exception.class, () -> batcher.checkpoint(update).get(1, TimeUnit.SECONDS));
+        assertInstanceOf(SuspendExecutionException.class, error.getCause());
+        assertTrue(batcher.isCheckpointTokenRevoked());
+        assertInstanceOf(
+                SuspendExecutionException.class,
+                assertThrows(Exception.class, () -> poller.get(1, TimeUnit.SECONDS))
+                        .getCause());
+        assertTrue(batcher.checkpoint(update).isCompletedExceptionally());
+        assertTrue(batcher.pollForUpdate("late").isCompletedExceptionally());
+        batcher.shutdown();
+        verify(client, times(1)).checkpoint(any(), any(), any());
+        verify(client, never()).getExecutionState(any(), any(), any());
+        assertTrue(callbackOperations.isEmpty());
+    }
+
+    @Test
+    void revocationFlushesLongDelayedRequestsWithoutWaitingForTheirTimer() throws Exception {
+        var started = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var delayed = new CheckpointManager(
+                DurableConfig.builder()
+                        .withDurableExecutionClient(client)
+                        .withCheckpointDelay(Duration.ofHours(1))
+                        .build(),
+                "arn",
+                "token",
+                operations -> {});
+        when(client.checkpoint(any(), any(), any())).thenAnswer(call -> {
+            started.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return CheckpointDurableExecutionResponse.builder().build();
+        });
+        var poller = delayed.pollForUpdate("poll", Instant.now());
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            var queued = delayed.checkpoint(OperationUpdate.builder()
+                    .id("step")
+                    .type(OperationType.STEP)
+                    .action(OperationAction.START)
+                    .build());
+            release.countDown();
+            assertInstanceOf(
+                    SuspendExecutionException.class,
+                    assertThrows(Exception.class, () -> queued.get(1, TimeUnit.SECONDS))
+                            .getCause());
+            assertTrue(poller.isCompletedExceptionally());
+            verify(client, times(1)).checkpoint(any(), any(), any());
+        } finally {
+            release.countDown();
+            delayed.shutdown();
+        }
     }
 
     @Test

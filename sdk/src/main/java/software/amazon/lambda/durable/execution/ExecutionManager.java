@@ -109,7 +109,8 @@ public class ExecutionManager implements SafeCloseable {
                 input.checkpointToken(),
                 this::onCheckpointComplete,
                 this::tryStartCheckpointProcessing,
-                this::finishCheckpointProcessing);
+                this::finishCheckpointProcessing,
+                this::signalSuspension);
 
         this.operationStorage = checkpointManager.fetchAllPages(input.initialExecutionState()).stream()
                 .collect(Collectors.toConcurrentMap(Operation::id, op -> op));
@@ -595,9 +596,17 @@ public class ExecutionManager implements SafeCloseable {
     /** Shutdown the checkpoint batcher. */
     @Override
     public void close() {
-        validateRunningThreads();
+        drainOperations();
+    }
 
+    /** Settles user work and stops polling before choosing the invocation's final outcome. */
+    void drainOperations() {
+        validateRunningThreads();
         checkpointManager.shutdown();
+    }
+
+    public boolean isCheckpointTokenRevoked() {
+        return checkpointManager.isCheckpointTokenRevoked();
     }
 
     private void validateRunningThreads() {

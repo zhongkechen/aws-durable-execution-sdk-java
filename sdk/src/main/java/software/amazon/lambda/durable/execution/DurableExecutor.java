@@ -114,88 +114,68 @@ public class DurableExecutor {
                     },
                     config.getExecutorService()); // Get executor from config for running user code
 
-            // Execute the handlerFuture in ExecutionManager. If it completes successfully, the output of user function
-            // will be returned. Otherwise, it will complete exceptionally with a SuspendExecutionException or a
-            // failure.
+            // Join on the invocation thread so a bounded user executor can finish queued operations.
+            var handlerResult = executionManager
+                    .runUntilCompleteOrSuspend(handlerFuture)
+                    .handle(HandlerResult::new)
+                    .join();
+            executionManager.drainOperations();
+
             try {
-                return executionManager
-                        .runUntilCompleteOrSuspend(handlerFuture)
-                        .handle((result, ex) -> {
-                            if (ex != null) {
-                                // an exception thrown from handlerFuture or suspension/termination occurred
-                                Throwable cause = ExceptionHelper.unwrapCompletableFuture(ex);
-
-                                // return PENDING if it's SuspendExecutionException
-                                if (cause instanceof SuspendExecutionException) {
-                                    fireOnInvocationEnd(
-                                            pluginRunner,
-                                            executionManager,
-                                            requestId,
-                                            executionArn,
-                                            isFirstInvocation,
-                                            InvocationStatus.PENDING,
-                                            null,
-                                            pluginExecutionInput.get(),
-                                            null);
-                                    return DurableExecutionOutput.pending();
-                                }
-
-                                // let the backend retry the invocation if the exception is retryable
-                                if (cause
-                                                instanceof
-                                                UnrecoverableDurableExecutionException
-                                                        unrecoverableDurableExecutionException
-                                        && unrecoverableDurableExecutionException.isRetryable()) {
-                                    fireOnInvocationEnd(
-                                            pluginRunner,
-                                            executionManager,
-                                            requestId,
-                                            executionArn,
-                                            isFirstInvocation,
-                                            InvocationStatus.RETRYING,
-                                            cause,
-                                            pluginExecutionInput.get(),
-                                            null);
-                                    throw unrecoverableDurableExecutionException;
-                                }
-
-                                // fail the execution otherwise
-                                logger.debug("Execution failed: {}", cause.getMessage());
-                                fireOnInvocationEnd(
-                                        pluginRunner,
-                                        executionManager,
-                                        requestId,
-                                        executionArn,
-                                        isFirstInvocation,
-                                        InvocationStatus.FAILED,
-                                        cause,
-                                        pluginExecutionInput.get(),
-                                        null);
-                                return DurableExecutionOutput.failure(buildErrorObject(cause, config.getSerDes()));
-                            }
-                            // user handler complete successfully
-                            logger.debug("Execution completed");
-                            var outputPayload = config.getSerDes().serialize(result);
-                            var output =
-                                    DurableExecutionOutput.success(handleLargePayload(executionManager, outputPayload));
-                            fireOnInvocationEnd(
-                                    pluginRunner,
-                                    executionManager,
-                                    requestId,
-                                    executionArn,
-                                    isFirstInvocation,
-                                    InvocationStatus.SUCCEEDED,
-                                    null,
-                                    pluginExecutionInput.get(),
-                                    result);
-                            return output;
-                        })
-                        .join();
+                var outcome = finishInvocation(handlerResult, executionManager, config);
+                fireOnInvocationEnd(
+                        pluginRunner,
+                        executionManager,
+                        requestId,
+                        executionArn,
+                        isFirstInvocation,
+                        outcome.status(),
+                        outcome.error(),
+                        pluginExecutionInput.get(),
+                        outcome.status() == InvocationStatus.SUCCEEDED ? handlerResult.result() : null);
+                if (outcome.status() == InvocationStatus.RETRYING) {
+                    ExceptionHelper.sneakyThrow(outcome.error());
+                }
+                return outcome.output();
             } catch (CompletionException e) {
-                // unwrap the CompletionException and rethrow the wrapped exception
                 ExceptionHelper.sneakyThrow(ExceptionHelper.unwrapCompletableFuture(e));
                 return null;
             }
+        }
+    }
+
+    private record HandlerResult(Object result, Throwable error) {}
+
+    private record InvocationOutcome(DurableExecutionOutput output, InvocationStatus status, Throwable error) {}
+
+    private static InvocationOutcome finishInvocation(
+            HandlerResult handlerResult, ExecutionManager executionManager, DurableConfig config) {
+        var cause = ExceptionHelper.unwrapCompletableFuture(handlerResult.error());
+        if (executionManager.isCheckpointTokenRevoked() || cause instanceof SuspendExecutionException) {
+            return new InvocationOutcome(DurableExecutionOutput.pending(), InvocationStatus.PENDING, null);
+        }
+        if (cause instanceof UnrecoverableDurableExecutionException error && error.isRetryable()) {
+            return new InvocationOutcome(null, InvocationStatus.RETRYING, cause);
+        }
+        if (cause != null) {
+            return new InvocationOutcome(
+                    DurableExecutionOutput.failure(buildErrorObject(cause, config.getSerDes())),
+                    InvocationStatus.FAILED,
+                    cause);
+        }
+
+        // Polling is stopped and submitted checkpoints have settled. Only this terminal update can now use the token.
+        var payload = config.getSerDes().serialize(handlerResult.result());
+        try {
+            return new InvocationOutcome(
+                    DurableExecutionOutput.success(handleLargePayload(executionManager, payload)),
+                    InvocationStatus.SUCCEEDED,
+                    null);
+        } catch (CompletionException e) {
+            if (ExceptionHelper.unwrapCompletableFuture(e) instanceof SuspendExecutionException) {
+                return new InvocationOutcome(DurableExecutionOutput.pending(), InvocationStatus.PENDING, null);
+            }
+            throw e;
         }
     }
 
